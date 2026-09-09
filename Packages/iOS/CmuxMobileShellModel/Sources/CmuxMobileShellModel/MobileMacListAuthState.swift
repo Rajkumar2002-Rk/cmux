@@ -1,14 +1,27 @@
 public import Foundation
 public import Observation
 
+private func entriesWithMinimumSupportedVersion(
+    _ entries: [String: MobileMacListAuthState.Entry],
+    minimum: String?,
+    shouldOverride: Bool
+) -> [String: MobileMacListAuthState.Entry] {
+    guard shouldOverride else { return entries }
+    return entries.mapValues { entry in
+        var updated = entry
+        updated.minimumSupportedVersion = minimum
+        return updated
+    }
+}
+
 /// The phone's view of the account device list (the list-auth admission
 /// authority), projected for UI.
 ///
 /// Written by the irx composition on every applied directory fact and on
-/// sign-out; read by the Computers surfaces to warn about Macs the new
-/// connection system has not verified yet (directory `status == "seeded"`:
-/// a binding never confirmed by its own control-plane hello, i.e. a Mac
-/// still running a pre-list-auth cmux).
+/// sign-out; read by the Computers surfaces to warn when a remembered Mac
+/// build is below the current minimum or when the directory has no build for
+/// that Mac yet. A missing build is treated as possibly too old until the Mac
+/// advertises its version.
 ///
 /// A process-wide shared instance is the seam here because the writer lives
 /// in `cmuxFeature` (the transport composition) and the readers live in
@@ -42,13 +55,16 @@ public final class MobileMacListAuthState {
             self.minimumSupportedVersion = minimumSupportedVersion
         }
 
-        /// True only when both versions are known and the Mac is below the
-        /// server floor. Malformed or channel-only values stay informational.
+        /// True when the server floor is valid and the Mac is either missing
+        /// or has an unparsable build version, or is below that floor. An
+        /// unusable reported version cannot establish compatibility, so it is
+        /// treated as possibly too old until a valid hello arrives.
         public var isOutdated: Bool {
-            guard let appVersion, let minimumSupportedVersion,
-                  let installed = Self.numericVersion(appVersion),
+            guard let minimumSupportedVersion,
                   let required = Self.numericVersion(minimumSupportedVersion)
             else { return false }
+            guard let appVersion else { return true }
+            guard let installed = Self.numericVersion(appVersion) else { return true }
             return installed.lexicographicallyPrecedes(required)
         }
 
@@ -76,6 +92,12 @@ public final class MobileMacListAuthState {
     /// Account-level minimum Mac version from the latest directory fact.
     public private(set) var minimumSupportedMacVersion: String?
 
+    /// The current iOS build's policy floor, when the shell has installed one.
+    /// This takes precedence over the legacy directory fact because the same
+    /// account can be viewed by multiple iOS builds with different floors.
+    private var policyMinimumSupportedMacVersion: String?
+    private var hasPolicyMinimumSupportedMacVersion = false
+
     public init() {}
 
     public func replace(
@@ -83,10 +105,42 @@ public final class MobileMacListAuthState {
         entriesByDeviceID: [String: Entry],
         minimumSupportedMacVersion: String? = nil
     ) {
-        self.entriesByEndpointID = entriesByEndpointID
-        self.entriesByDeviceID = entriesByDeviceID
-        self.minimumSupportedMacVersion = minimumSupportedMacVersion
+        let effectiveMinimum = hasPolicyMinimumSupportedMacVersion
+            ? policyMinimumSupportedMacVersion
+            : minimumSupportedMacVersion
+        let shouldOverride = hasPolicyMinimumSupportedMacVersion
+            || minimumSupportedMacVersion != nil
+        self.entriesByEndpointID = entriesWithMinimumSupportedVersion(
+            entriesByEndpointID,
+            minimum: effectiveMinimum,
+            shouldOverride: shouldOverride
+        )
+        self.entriesByDeviceID = entriesWithMinimumSupportedVersion(
+            entriesByDeviceID,
+            minimum: effectiveMinimum,
+            shouldOverride: shouldOverride
+        )
+        self.minimumSupportedMacVersion = effectiveMinimum
         hasSnapshot = true
+    }
+
+    /// Installs the minimum Mac version for this iOS build and reapplies it to
+    /// already-projected rows. A `nil` value is an intentional fail-open policy
+    /// with no tier for the running iOS version.
+    public func applyPolicyMinimumSupportedMacVersion(_ minimum: String?) {
+        policyMinimumSupportedMacVersion = minimum
+        hasPolicyMinimumSupportedMacVersion = true
+        entriesByEndpointID = entriesWithMinimumSupportedVersion(
+            entriesByEndpointID,
+            minimum: minimum,
+            shouldOverride: true
+        )
+        entriesByDeviceID = entriesWithMinimumSupportedVersion(
+            entriesByDeviceID,
+            minimum: minimum,
+            shouldOverride: true
+        )
+        minimumSupportedMacVersion = minimum
     }
 
     public func clear() {
@@ -104,9 +158,10 @@ public final class MobileMacListAuthState {
         entriesByDeviceID[deviceID]
     }
 
-    /// The Computers-row warning predicate: the Mac exists in the directory
-    /// but was seeded by the account overlay and has never confirmed itself
-    /// on the new connection system.
+    /// Whether the directory still has a seeded overlay for this Mac. This is
+    /// retained for connection admission diagnostics; the user-facing warning
+    /// is derived from `isOutdated`, including when the seeded row has no
+    /// remembered version yet.
     public func isSeeded(deviceID: String) -> Bool {
         entriesByDeviceID[deviceID]?.status == "seeded"
     }

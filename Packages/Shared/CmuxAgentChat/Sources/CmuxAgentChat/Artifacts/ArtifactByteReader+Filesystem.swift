@@ -263,12 +263,31 @@ extension ArtifactByteReader {
         path: String,
         expectedCanonicalPath: String
     ) throws -> Int32 {
-        let descriptor = Darwin.open(
+        let flags = O_RDONLY | O_DIRECTORY | O_NONBLOCK | O_CLOEXEC
+        let noFollowDescriptor = Darwin.open(
             path,
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+            flags | O_NOFOLLOW
         )
-        guard descriptor >= 0 else {
-            throw filesystemError(errno: errno)
+        let descriptor: Int32
+        if noFollowDescriptor >= 0 {
+            descriptor = noFollowDescriptor
+        } else {
+            let errorCode = Darwin.errno
+            guard errorCode == ELOOP else {
+                throw filesystemError(errno: errorCode)
+            }
+
+            // System aliases such as `/tmp` and `/var` are symlinks in the
+            // lexical path's final component. Retry only with the canonical
+            // parent captured during authorization; retaining O_NOFOLLOW
+            // avoids following a swapped or otherwise untrusted alias.
+            descriptor = Darwin.open(
+                expectedCanonicalPath,
+                flags | O_NOFOLLOW
+            )
+            guard descriptor >= 0 else {
+                throw filesystemError(errno: Darwin.errno)
+            }
         }
         var metadata = Darwin.stat()
         guard Darwin.fstat(descriptor, &metadata) == 0 else {
